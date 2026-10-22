@@ -8,7 +8,7 @@ import hashlib
 import ipaddress
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from urllib.parse import urlsplit
 
 SUPPORTED_SCHEMES = {
@@ -25,6 +25,7 @@ SUPPORTED_SCHEMES = {
 _SCHEME_LINE = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.-]*://")
 _HOST_LABEL = re.compile(r"^[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$")
 DEFAULT_RETENTION_LIMIT = 40
+V2RAYNG_PROTOCOLS = frozenset({"vless", "vmess", "trojan", "ss"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -36,6 +37,7 @@ class Configuration:
     status: str = "untested"
     latency_ms: float | None = None
     healthy: bool | None = None
+    subscription_uri: str | None = field(default=None, repr=False, compare=False)
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -160,7 +162,7 @@ def parse_configuration(uri: str) -> Configuration:
     protocol = "socks" if scheme in {"socks", "socks5", "socks5h"} else scheme
     identity = f"{protocol}\0{safe_host}\0{port}"
     identifier = hashlib.sha256(identity.encode("utf-8")).hexdigest()
-    return Configuration(identifier, protocol, safe_host, port)
+    return Configuration(identifier, protocol, safe_host, port, subscription_uri=value)
 
 
 def parse_subscription(text: str) -> tuple[list[Configuration], int]:
@@ -178,6 +180,20 @@ def parse_subscription(text: str) -> tuple[list[Configuration], int]:
             continue
         configurations.setdefault(configuration.id, configuration)
     return list(configurations.values()), invalid_count
+
+
+def encode_subscription(configurations: list[Configuration]) -> str:
+    """Encode validated source URIs as a v2rayNG-compatible Base64 subscription."""
+    uris = [
+        configuration.subscription_uri
+        for configuration in configurations
+        if configuration.subscription_uri is not None
+        and configuration.protocol in V2RAYNG_PROTOCOLS
+    ]
+    if not uris:
+        return ""
+    payload = "\n".join(uris).encode("utf-8")
+    return base64.b64encode(payload).decode("ascii")
 
 
 def rank_configurations(

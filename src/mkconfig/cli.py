@@ -6,11 +6,13 @@ import argparse
 import asyncio
 import json
 import logging
+import os
 import sys
+import tempfile
 from pathlib import Path
 
 from .collector import Source, collect
-from .core import DEFAULT_RETENTION_LIMIT
+from .core import DEFAULT_RETENTION_LIMIT, V2RAYNG_PROTOCOLS, encode_subscription
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -28,7 +30,38 @@ def _parser() -> argparse.ArgumentParser:
     refresh.add_argument("--timeout", type=float, default=15)
     refresh.add_argument("--max-response-bytes", type=int, default=1_048_576)
     refresh.add_argument("--concurrency", type=int, default=5)
+    refresh.add_argument(
+        "--output",
+        type=Path,
+        help="atomically write a Base64 subscription file when valid results exist",
+    )
     return parser
+
+
+def _write_subscription(configurations, output: Path) -> int:
+    encoded = encode_subscription(configurations)
+    if not encoded:
+        return 0
+
+    output.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="ascii", dir=output.parent, delete=False
+        ) as temporary_file:
+            temporary_path = Path(temporary_file.name)
+            temporary_file.write(encoded)
+            temporary_file.flush()
+            os.fsync(temporary_file.fileno())
+        temporary_path.replace(output)
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+    return sum(
+        configuration.protocol in V2RAYNG_PROTOCOLS
+        and configuration.subscription_uri is not None
+        for configuration in configurations
+    )
 
 
 async def _refresh(args: argparse.Namespace) -> int:
@@ -64,8 +97,20 @@ async def _refresh(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 2
-    print(json.dumps(report.to_dict(), indent=2, sort_keys=True))
-    return 0
+    result = report.to_dict()
+    result["last_updated_at"] = report.refreshed_at
+    result["successful_source_count"] = sum(
+        source.status == "ok" for source in report.sources
+    )
+    result["connection_test_status"] = "untested"
+    if args.output is not None:
+        published_count = _write_subscription(report.configurations, args.output)
+        result["published_count"] = published_count
+        result["publication_status"] = (
+            "updated" if published_count else "preserved_previous"
+        )
+    print(json.dumps(result, indent=2, sort_keys=True))
+    return 1 if args.output is not None and not published_count else 0
 
 
 def main() -> int:
