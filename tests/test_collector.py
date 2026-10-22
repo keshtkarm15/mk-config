@@ -66,6 +66,26 @@ def test_collect_deduplicates_and_reports_untested():
     assert "private" not in str(report.to_dict())
 
 
+def test_collection_retention_defaults_to_40_and_accepts_override():
+    links = "\n".join(f"vless://id@node-{index}.example:443" for index in range(45))
+    source = Source("sample", "https://source.example/sub")
+
+    default_report = run(
+        collect([source], session=FakeSession(FakeResponse(body=links.encode())))
+    )
+    limited_report = run(
+        collect(
+            [source],
+            retention_limit=7,
+            session=FakeSession(FakeResponse(body=links.encode())),
+        )
+    )
+
+    assert default_report.discovered_count == 45
+    assert default_report.retained_count == len(default_report.configurations) == 40
+    assert limited_report.retained_count == len(limited_report.configurations) == 7
+
+
 @pytest.mark.parametrize(
     ("response", "error", "expected"),
     [
