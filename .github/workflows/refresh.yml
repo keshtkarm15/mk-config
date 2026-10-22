@@ -19,14 +19,11 @@ jobs:
     runs-on: ubuntu-latest
     env:
       RETENTION_LIMIT: ${{ inputs.retention_limit || '40' }}
-      MKCONFIG_SOURCES_JSON: ${{ secrets.MKCONFIG_SOURCES_JSON }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
       - run: python -m pip install .
-      - name: Prepare ignored source configuration
-        run: python -c 'import os,pathlib; value=os.environ.get("MKCONFIG_SOURCES_JSON") or pathlib.Path("sources.example.json").read_text(); pathlib.Path("sources.json").write_text(value)'
       - name: Collect safe metadata
-        run: mkconfig refresh --sources sources.json --limit "$RETENTION_LIMIT"
+        run: mkconfig refresh --sources sources.example.json --limit "$RETENTION_LIMIT"

@@ -1,4 +1,13 @@
 {
   "retention_limit": 40,
-  "sources": []
+  "sources": [
+    {
+      "name": "shadowsocks-aggregator-eternity",
+      "url": "https://raw.githubusercontent.com/mahdibland/ShadowsocksAggregator/master/Eternity.txt"
+    },
+    {
+      "name": "pawdroid-free-servers",
+      "url": "https://raw.githubusercontent.com/Pawdroid/Free-servers/main/sub"
+    }
+  ]
 }

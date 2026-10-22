@@ -1,4 +1,5 @@
 import asyncio
+import logging
 
 import pytest
 
@@ -92,6 +93,7 @@ def test_collection_retention_defaults_to_40_and_accepts_override():
         (FakeResponse(status=503), None, "http_error"),
         (FakeResponse(body=b""), None, "empty"),
         (FakeResponse(body=b"x" * 20), None, "response_too_large"),
+        (FakeResponse(body=b"%%%"), None, "invalid_base64"),
         (None, TimeoutError(), "timeout"),
     ],
 )
@@ -103,11 +105,42 @@ def test_source_failure_empty_and_size_limits(response, error, expected):
             session=FakeSession(response, error),
         )
     )
+    assert report.sources[0].status != "ok"
+    assert report.sources[0].count == 0
     assert (
         report.sources[0].error == expected
         if expected != "empty"
         else report.sources[0].status == expected
     )
+
+
+def test_valid_source_results_survive_another_source_failure():
+    response = FakeResponse(body=b"vless://id@node.example:443")
+
+    class SelectiveFakeSession:
+        def get(self, url, **kwargs):
+            assert kwargs["allow_redirects"] is False
+            if "unavailable.example" in url:
+                raise TimeoutError()
+            return response
+
+    report = run(
+        collect(
+            [
+                Source("unavailable", "https://unavailable.example/sub"),
+                Source("valid", "https://valid.example/sub"),
+            ],
+            session=SelectiveFakeSession(),
+        )
+    )
+
+    assert report.sources[0].status == "error"
+    assert report.sources[0].error == "timeout"
+    assert report.sources[1].status == "ok"
+    assert report.discovered_count == report.retained_count == 1
+    assert report.configurations[0].status == "untested"
+    assert report.configurations[0].healthy is None
+    assert report.configurations[0].latency_ms is None
 
 
 def test_reject_unsafe_source_urls():
@@ -147,6 +180,23 @@ def test_unsafe_source_is_not_requested():
         collect([Source("local", "https://localhost/secret")], session=FakeSession())
     )
     assert report.sources[0].error == "unsafe_source_url"
+
+
+def test_logs_and_report_do_not_expose_source_url_or_query(caplog):
+    source_url = "https://source.example/private-path?key=synthetic-marker"
+    caplog.set_level(logging.INFO, logger="mkconfig")
+    report = run(
+        collect(
+            [Source("sensitive-label", source_url)],
+            session=FakeSession(FakeResponse(body=b"vless://id@node.example:443")),
+        )
+    )
+
+    assert source_url not in caplog.text
+    assert "synthetic-marker" not in caplog.text
+    assert source_url not in str(report.to_dict())
+    assert "synthetic-marker" not in str(report.to_dict())
+    assert report.sources[0].name == "source-1"
 
 
 @pytest.mark.parametrize(
