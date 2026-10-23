@@ -9,21 +9,24 @@ import hmac
 import ipaddress
 import json
 import logging
+import math
 import os
 import shutil
 import socket
 import tempfile
 import time
 import uuid as uuid_module
-from contextlib import asynccontextmanager
+import weakref
+from concurrent.futures import ThreadPoolExecutor
 from collections import deque
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlsplit
 
 from fastapi import FastAPI, Header, HTTPException, Request
 
-from .core import parse_configuration
+from .core import is_reserved_hostname, parse_configuration
 from .testing import is_tehran_test_window
 
 logger = logging.getLogger("mkconfig.tester")
@@ -31,8 +34,12 @@ MAX_REQUEST_BYTES = 16_384
 MAX_URI_BYTES = 8_192
 MAX_TESTS_PER_MINUTE = 8
 MAX_CONCURRENT_TESTS = 2
+REQUEST_ID_TTL_SECONDS = 120
 PROXY_START_TIMEOUT_SECONDS = 3
 PROBE_TIMEOUT_SECONDS = 12
+MAX_TEST_EXECUTION_SECONDS = 18
+DNS_RESOLUTION_TIMEOUT_SECONDS = 4
+PROCESS_TERMINATION_GRACE_SECONDS = 1
 SUPPORTED_PROTOCOLS = frozenset({"vless", "vmess", "trojan", "ss"})
 SUPPORTED_TRANSPORTS = frozenset({"tcp", "ws", "grpc"})
 SUPPORTED_SS_METHODS = frozenset(
@@ -42,6 +49,13 @@ SUPPORTED_SS_METHODS = frozenset(
 _test_slots = asyncio.Semaphore(MAX_CONCURRENT_TESTS)
 _rate_lock = asyncio.Lock()
 _request_times: deque[float] = deque()
+_request_id_lock = asyncio.Lock()
+_used_request_ids: dict[str, float] = {}
+_dns_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="mkconfig-dns")
+_dns_slots_by_loop: weakref.WeakKeyDictionary[
+    asyncio.AbstractEventLoop, asyncio.Semaphore
+] = weakref.WeakKeyDictionary()
+_pending_reap_tasks: set[asyncio.Task[int]] = set()
 
 
 class TesterError(ValueError):
@@ -69,8 +83,30 @@ def _decode_base64(value: str) -> bytes:
         raise TesterError("invalid_configuration") from error
 
 
-def _candidate_id(uri: str, token: str) -> str:
-    return hmac.new(token.encode("utf-8"), uri.encode("utf-8"), "sha256").hexdigest()
+def _candidate_id(uri: str, request_id: str, token: str) -> str:
+    message = b"candidate\0" + request_id.encode("ascii") + b"\0" + uri.encode("utf-8")
+    return hmac.new(token.encode("utf-8"), message, "sha256").hexdigest()
+
+
+def _response_signature(
+    payload: dict[str, object], uri: str, token: str
+) -> str:
+    message = json.dumps(
+        {"uri": uri, **payload}, sort_keys=True, separators=(",", ":"), allow_nan=False
+    ).encode("utf-8")
+    return hmac.new(token.encode("utf-8"), message, "sha256").hexdigest()
+
+
+def _signed_result(
+    payload: dict[str, object], uri: str, request_id: str, token: str
+) -> dict[str, object]:
+    response = {
+        **payload,
+        "request_id": request_id,
+        "candidate_id": _candidate_id(uri, request_id, token),
+    }
+    response["response_signature"] = _response_signature(response, uri, token)
+    return response
 
 
 def _tls_options(host: str, enabled: bool, server_name: str = "") -> dict[str, object]:
@@ -291,6 +327,34 @@ def _resolve_public_ip(host: str, port: int) -> str:
     return addresses[0].compressed
 
 
+async def _resolve_public_ip_bounded(host: str, port: int) -> str:
+    loop = asyncio.get_running_loop()
+    slots = _dns_slots_by_loop.get(loop)
+    if slots is None:
+        slots = asyncio.Semaphore(2)
+        _dns_slots_by_loop[loop] = slots
+    await slots.acquire()
+    future = loop.run_in_executor(_dns_executor, _resolve_public_ip, host, port)
+    defer_slot_release = False
+    try:
+        return await asyncio.wait_for(
+            asyncio.shield(future), timeout=DNS_RESOLUTION_TIMEOUT_SECONDS
+        )
+    except TimeoutError as error:
+        defer_slot_release = True
+        raise TesterError("dns_timeout") from error
+    except asyncio.CancelledError:
+        defer_slot_release = True
+        raise
+    finally:
+        if defer_slot_release:
+            future.add_done_callback(
+                lambda _: loop.call_soon_threadsafe(slots.release)
+            )
+        else:
+            slots.release()
+
+
 def _probe_settings() -> tuple[str, str, int]:
     url = os.getenv("MKCONFIG_TEST_URL", "https://www.gstatic.com/generate_204")
     allowed = {
@@ -310,6 +374,7 @@ def _probe_settings() -> tuple[str, str, int]:
         or parsed.query
         or port != 443
         or host not in allowed
+        or is_reserved_hostname(host)
     ):
         raise RuntimeError("invalid_test_endpoint_configuration")
     return url, host, port
@@ -323,6 +388,22 @@ async def _allow_request() -> bool:
         if len(_request_times) >= MAX_TESTS_PER_MINUTE:
             return False
         _request_times.append(now)
+        return True
+
+
+async def _claim_request_id(request_id: str) -> bool:
+    now = time.monotonic()
+    async with _request_id_lock:
+        expired = [
+            key
+            for key, claimed_at in _used_request_ids.items()
+            if now - claimed_at >= REQUEST_ID_TTL_SECONDS
+        ]
+        for key in expired:
+            del _used_request_ids[key]
+        if request_id in _used_request_ids:
+            return False
+        _used_request_ids[request_id] = now
         return True
 
 
@@ -343,7 +424,18 @@ async def _read_request_body(request: Request) -> dict[str, object]:
         data = json.loads(body)
     except (ValueError, UnicodeDecodeError) as error:
         raise HTTPException(status_code=400, detail="invalid_request") from error
-    if not isinstance(data, dict) or set(data) != {"uri"} or not isinstance(data["uri"], str):
+    if (
+        not isinstance(data, dict)
+        or set(data) != {"uri", "request_id"}
+        or not isinstance(data["uri"], str)
+        or not isinstance(data["request_id"], str)
+    ):
+        raise HTTPException(status_code=400, detail="invalid_request")
+    try:
+        request_id = str(uuid_module.UUID(data["request_id"]))
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail="invalid_request") from error
+    if request_id != data["request_id"]:
         raise HTTPException(status_code=400, detail="invalid_request")
     try:
         uri_size = len(data["uri"].encode("utf-8"))
@@ -351,7 +443,45 @@ async def _read_request_body(request: Request) -> dict[str, object]:
         raise HTTPException(status_code=400, detail="invalid_request") from error
     if not data["uri"] or uri_size > MAX_URI_BYTES:
         raise HTTPException(status_code=413, detail="request_too_large")
+    data["request_id"] = request_id
     return data
+
+
+async def _terminate_process_group(process: asyncio.subprocess.Process) -> None:
+    try:
+        os.killpg(process.pid, 15)
+    except ProcessLookupError:
+        await _reap_process_bounded(process)
+        return
+
+    deadline = time.monotonic() + PROCESS_TERMINATION_GRACE_SECONDS
+    group_exited = False
+    while time.monotonic() < deadline:
+        try:
+            os.killpg(process.pid, 0)
+        except ProcessLookupError:
+            group_exited = True
+            break
+        await asyncio.sleep(0.02)
+    if not group_exited:
+        try:
+            os.killpg(process.pid, 9)
+        except ProcessLookupError:
+            pass
+    await _reap_process_bounded(process)
+
+
+async def _reap_process_bounded(process: asyncio.subprocess.Process) -> None:
+    if process.returncode is not None:
+        return
+    wait_task = asyncio.create_task(process.wait())
+    try:
+        await asyncio.wait_for(
+            asyncio.shield(wait_task), timeout=PROCESS_TERMINATION_GRACE_SECONDS
+        )
+    except TimeoutError:
+        _pending_reap_tasks.add(wait_task)
+        wait_task.add_done_callback(_pending_reap_tasks.discard)
 
 
 class SingBoxRunner:
@@ -374,12 +504,12 @@ class SingBoxRunner:
         configuration = parse_configuration(uri)
         if configuration.protocol not in SUPPORTED_PROTOCOLS:
             return False, None, "unsupported_protocol", configuration.protocol
-        proxy_ip = await asyncio.to_thread(
-            _resolve_public_ip, configuration.host, configuration.port
+        proxy_ip = await _resolve_public_ip_bounded(
+            configuration.host, configuration.port
         )
         outbound = build_outbound(uri, proxy_ip)
         probe_url, probe_host, probe_port = _probe_settings()
-        probe_ip = await asyncio.to_thread(_resolve_public_ip, probe_host, probe_port)
+        probe_ip = await _resolve_public_ip_bounded(probe_host, probe_port)
         if not self.available:
             return False, None, "engine_unavailable", configuration.protocol
 
@@ -482,15 +612,7 @@ class SingBoxRunner:
                     return False, None, "probe_timeout", configuration.protocol
                 finally:
                     if "result" in locals() and result.returncode is None:
-                        try:
-                            os.killpg(result.pid, 15)
-                            await asyncio.wait_for(result.wait(), timeout=1)
-                        except (ProcessLookupError, TimeoutError):
-                            try:
-                                os.killpg(result.pid, 9)
-                            except ProcessLookupError:
-                                pass
-                            await result.wait()
+                        await _terminate_process_group(result)
                 if result.returncode != 0:
                     return False, None, "probe_failed", configuration.protocol
                 try:
@@ -503,15 +625,7 @@ class SingBoxRunner:
                 return True, latency_ms, None, configuration.protocol
             finally:
                 if process.returncode is None:
-                    try:
-                        os.killpg(process.pid, 15)
-                        await asyncio.wait_for(process.wait(), timeout=1)
-                    except (ProcessLookupError, TimeoutError):
-                        try:
-                            os.killpg(process.pid, 9)
-                        except ProcessLookupError:
-                            pass
-                        await process.wait()
+                    await _terminate_process_group(process)
 
     async def _wait_for_listener(self, process: asyncio.subprocess.Process, port: int) -> bool:
         deadline = time.monotonic() + PROXY_START_TIMEOUT_SECONDS
@@ -567,36 +681,52 @@ async def test_configuration(
     data = await _read_request_body(request)
     tested_at = datetime.now(UTC).isoformat()
     uri = data["uri"]
+    request_id = data["request_id"]
+    if not await _claim_request_id(request_id):
+        raise HTTPException(status_code=409, detail="request_replayed")
     try:
         configuration = parse_configuration(uri)
     except ValueError:
-        return {
-            "success": False,
-            "latency_ms": None,
-            "tested_at": tested_at,
-            "protocol": "unknown",
-            "error_code": "invalid_configuration",
-        }
+        return _signed_result(
+            {
+                "success": False,
+                "latency_ms": None,
+                "tested_at": tested_at,
+                "protocol": "unknown",
+                "error_code": "invalid_configuration",
+            },
+            uri,
+            request_id,
+            expected,
+        )
     if configuration.protocol not in SUPPORTED_PROTOCOLS:
-        return {
-            "success": False,
-            "latency_ms": None,
-            "tested_at": tested_at,
-            "protocol": configuration.protocol,
-            "configuration_id": configuration.id,
-            "candidate_id": _candidate_id(uri, expected),
-            "error_code": "unsupported_protocol",
-        }
+        return _signed_result(
+            {
+                "success": False,
+                "latency_ms": None,
+                "tested_at": tested_at,
+                "protocol": configuration.protocol,
+                "configuration_id": configuration.id,
+                "error_code": "unsupported_protocol",
+            },
+            uri,
+            request_id,
+            expected,
+        )
     if not is_tehran_test_window():
-        return {
-            "success": False,
-            "latency_ms": None,
-            "tested_at": tested_at,
-            "protocol": configuration.protocol,
-            "configuration_id": configuration.id,
-            "candidate_id": _candidate_id(uri, expected),
-            "error_code": "outside_test_window",
-        }
+        return _signed_result(
+            {
+                "success": False,
+                "latency_ms": None,
+                "tested_at": tested_at,
+                "protocol": configuration.protocol,
+                "configuration_id": configuration.id,
+                "error_code": "outside_test_window",
+            },
+            uri,
+            request_id,
+            expected,
+        )
     if _test_slots.locked():
         raise HTTPException(status_code=429, detail="tester_busy")
     try:
@@ -604,7 +734,16 @@ async def test_configuration(
     except TimeoutError as error:
         raise HTTPException(status_code=429, detail="tester_busy") from error
     try:
-        success, latency_ms, error_code, protocol = await app.state.runner.test(uri)
+        success, latency_ms, error_code, protocol = await asyncio.wait_for(
+            app.state.runner.test(uri), timeout=MAX_TEST_EXECUTION_SECONDS
+        )
+    except TimeoutError:
+        success, latency_ms, error_code, protocol = (
+            False,
+            None,
+            "test_timeout",
+            configuration.protocol,
+        )
     except TesterError as error:
         success, latency_ms, error_code, protocol = (
             False,
@@ -625,18 +764,50 @@ async def test_configuration(
         )
     finally:
         _test_slots.release()
+    if (
+        not isinstance(success, bool)
+        or protocol != configuration.protocol
+        or (
+            success
+            and (
+                isinstance(latency_ms, bool)
+                or not isinstance(latency_ms, (int, float))
+                or not math.isfinite(latency_ms)
+                or latency_ms < 0
+                or error_code is not None
+            )
+        )
+        or (
+            not success
+            and (
+                latency_ms is not None
+                or not isinstance(error_code, str)
+                or not error_code
+            )
+        )
+    ):
+        success, latency_ms, error_code, protocol = (
+            False,
+            None,
+            "invalid_test_result",
+            configuration.protocol,
+        )
     tested_at = datetime.now(UTC).isoformat()
     logger.info(
         "protocol test complete: protocol=%s success=%s",
         protocol,
         success,
     )
-    return {
-        "success": success,
-        "latency_ms": latency_ms,
-        "tested_at": tested_at,
-        "protocol": protocol,
-        "configuration_id": configuration.id,
-        "candidate_id": _candidate_id(uri, expected),
-        "error_code": error_code,
-    }
+    return _signed_result(
+        {
+            "success": success,
+            "latency_ms": latency_ms,
+            "tested_at": tested_at,
+            "protocol": protocol,
+            "configuration_id": configuration.id,
+            "error_code": error_code,
+        },
+        uri,
+        request_id,
+        expected,
+    )

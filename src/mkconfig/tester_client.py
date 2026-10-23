@@ -10,6 +10,7 @@ import json
 import math
 from dataclasses import replace
 from datetime import datetime
+import uuid as uuid_module
 from urllib.parse import urlsplit
 
 import aiohttp
@@ -21,6 +22,7 @@ MAX_TESTER_TIMEOUT_SECONDS = 20
 MAX_TESTER_RESPONSE_BYTES = 4_096
 MAX_TESTER_CONCURRENCY = 2
 TESTER_REQUEST_INTERVAL_SECONDS = 8
+MAX_TEST_RESULT_AGE_SECONDS = 60
 
 
 class TesterClientError(ValueError):
@@ -110,12 +112,13 @@ async def test_configurations(
     async def test_one(configuration: Configuration) -> Configuration:
         if configuration.subscription_uri is None:
             raise TesterClientError("configuration_uri_missing")
+        request_id = str(uuid_module.uuid4())
         try:
             await pace_request()
             async with semaphore:
                 async with session.post(
                     endpoint,
-                    json={"uri": configuration.subscription_uri},
+                    json={"uri": configuration.subscription_uri, "request_id": request_id},
                     headers={"Authorization": f"Bearer {token}"},
                     allow_redirects=False,
                 ) as response:
@@ -132,15 +135,32 @@ async def test_configurations(
             raise TesterClientError("tester_unavailable") from None
 
         if (
+            set(result)
+            != {
+                "success",
+                "latency_ms",
+                "tested_at",
+                "protocol",
+                "configuration_id",
+                "error_code",
+                "request_id",
+                "candidate_id",
+                "response_signature",
+            }
+            or
             result.get("configuration_id") != configuration.id
             or result.get("protocol") != configuration.protocol
             or not isinstance(result.get("success"), bool)
+            or result.get("request_id") != request_id
         ):
             raise TesterClientError("tester_result_mismatch")
         expected_candidate_id = hmac.new(
             token.encode("utf-8"),
-            configuration.subscription_uri.encode("utf-8"),
-            hashlib.sha256,
+            b"candidate\0"
+            + request_id.encode("ascii")
+            + b"\0"
+            + configuration.subscription_uri.encode("utf-8"),
+            "sha256",
         ).hexdigest()
         if not hmac.compare_digest(
             str(result.get("candidate_id", "")), expected_candidate_id
@@ -155,6 +175,25 @@ async def test_configurations(
             raise TesterClientError("invalid_tester_response") from error
         if timestamp.tzinfo is None:
             raise TesterClientError("invalid_tester_response")
+        age_seconds = (datetime.now(timestamp.tzinfo) - timestamp).total_seconds()
+        if age_seconds < -5 or age_seconds > MAX_TEST_RESULT_AGE_SECONDS:
+            raise TesterClientError("stale_tester_response")
+
+        signed_fields = {key: value for key, value in result.items() if key != "response_signature"}
+        expected_signature = hmac.new(
+            token.encode("utf-8"),
+            json.dumps(
+                {"uri": configuration.subscription_uri, **signed_fields},
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            ).encode("utf-8"),
+            "sha256",
+        ).hexdigest()
+        if not hmac.compare_digest(
+            str(result.get("response_signature", "")), expected_signature
+        ):
+            raise TesterClientError("tester_response_signature_invalid")
 
         if result["success"]:
             latency = result.get("latency_ms")
