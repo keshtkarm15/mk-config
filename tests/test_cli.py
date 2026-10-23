@@ -2,6 +2,7 @@ import argparse
 import asyncio
 import base64
 import json
+from dataclasses import replace
 
 from mkconfig import cli
 from mkconfig.collector import CollectionReport, SourceStatus
@@ -64,6 +65,17 @@ def test_subscription_output_is_base64_of_valid_deduplicated_uris(tmp_path):
     assert "password" not in str([item.to_dict() for item in configurations])
 
 
+def test_subscription_writer_limit_and_repeat_output(tmp_path):
+    configurations = _sample_configurations()
+    output = tmp_path / "subscription.txt"
+    assert cli._write_subscription(configurations, output, limit=2) == 2
+    first = output.read_text(encoding="ascii")
+    assert len(base64.b64decode(first, validate=True).decode().splitlines()) == 2
+
+    assert cli._write_subscription(configurations, output, limit=2) == 2
+    assert output.read_text(encoding="ascii") == first
+
+
 def test_empty_refresh_preserves_previous_subscription(tmp_path):
     output = tmp_path / "subscription.txt"
     previous = base64.b64encode(b"previous-valid-subscription").decode("ascii")
@@ -94,7 +106,7 @@ def test_refresh_reports_publication_and_source_metrics(tmp_path, monkeypatch, c
         configurations=configurations,
         sources=[
             SourceStatus("source-1", "ok", 4),
-            SourceStatus("source-2", "error", 0, error="timeout"),
+            SourceStatus("source-2", "empty", 0),
         ],
         discovered_count=4,
         retained_count=4,
@@ -103,7 +115,20 @@ def test_refresh_reports_publication_and_source_metrics(tmp_path, monkeypatch, c
     async def fake_collect(*args, **kwargs):
         return report
 
+    async def fake_test_configurations(configs, tester_url, token):
+        assert tester_url == "https://tester.example"
+        assert token == "test-token-value-that-is-at-least-32-characters"
+        return [
+            replace(item, status="tested", healthy=True, latency_ms=10.0)
+            for item in configs
+        ]
+
     monkeypatch.setattr(cli, "collect", fake_collect)
+    monkeypatch.setattr(cli, "test_configurations", fake_test_configurations)
+    monkeypatch.setenv("MKCONFIG_TESTER_URL", "https://tester.example")
+    monkeypatch.setenv(
+        "MKCONFIG_TESTER_TOKEN", "test-token-value-that-is-at-least-32-characters"
+    )
     exit_code = asyncio.run(cli._refresh(_arguments(source_file, output)))
     result = json.loads(capsys.readouterr().out)
 
@@ -111,7 +136,8 @@ def test_refresh_reports_publication_and_source_metrics(tmp_path, monkeypatch, c
     assert result["published_count"] == 4
     assert result["successful_source_count"] == 1
     assert result["last_updated_at"] == report.refreshed_at
-    assert result["connection_test_status"] == "untested"
+    assert result["connection_test_status"] == "tested"
+    assert result["tested_count"] == 4
     assert result["publication_status"] == "updated"
 
 
@@ -143,3 +169,240 @@ def test_empty_refresh_reports_preserved_output_and_failure(
     assert result["successful_source_count"] == 0
     assert result["publication_status"] == "preserved_previous"
     assert output.read_text(encoding="ascii") == previous
+
+
+def test_source_failure_preserves_previous_subscription(tmp_path, monkeypatch, capsys):
+    source_file = tmp_path / "sources.json"
+    source_file.write_text('{"retention_limit": 40, "sources": []}', encoding="utf-8")
+    output = tmp_path / "subscription.txt"
+    previous = base64.b64encode(b"previous-valid-subscription").decode("ascii")
+    output.write_text(previous, encoding="ascii")
+    configurations = _sample_configurations()
+    report = CollectionReport(
+        refreshed_at="2026-10-22T00:00:00+00:00",
+        configurations=configurations,
+        sources=[
+            SourceStatus("source-1", "ok", 4),
+            SourceStatus("source-2", "error", 0, error="timeout"),
+        ],
+        discovered_count=4,
+        retained_count=4,
+    )
+
+    async def fake_collect(*args, **kwargs):
+        return report
+
+    monkeypatch.setattr(cli, "collect", fake_collect)
+    exit_code = asyncio.run(cli._refresh(_arguments(source_file, output)))
+    result = json.loads(capsys.readouterr().out)
+
+    assert exit_code == 1
+    assert result["publication_status"] == "preserved_previous"
+    assert output.read_text(encoding="ascii") == previous
+
+
+def test_missing_tester_configuration_preserves_previous_subscription(
+    tmp_path, monkeypatch, capsys
+):
+    source_file = tmp_path / "sources.json"
+    source_file.write_text('{"retention_limit": 40, "sources": []}', encoding="utf-8")
+    output = tmp_path / "subscription.txt"
+    previous = base64.b64encode(b"previous-valid-subscription").decode("ascii")
+    output.write_text(previous, encoding="ascii")
+    report = CollectionReport(
+        refreshed_at="2026-10-22T00:00:00+00:00",
+        configurations=_sample_configurations(),
+        sources=[SourceStatus("source-1", "ok", 4)],
+        discovered_count=4,
+        retained_count=4,
+    )
+
+    async def fake_collect(*args, **kwargs):
+        return report
+
+    monkeypatch.setattr(cli, "collect", fake_collect)
+    monkeypatch.delenv("MKCONFIG_TESTER_URL", raising=False)
+    monkeypatch.delenv("MKCONFIG_TESTER_TOKEN", raising=False)
+    exit_code = asyncio.run(cli._refresh(_arguments(source_file, output)))
+    result = json.loads(capsys.readouterr().out)
+
+    assert exit_code == 1
+    assert result["test_error"] == "tester_not_configured"
+    assert result["publication_status"] == "preserved_previous"
+    assert output.read_text(encoding="ascii") == previous
+
+
+def test_custom_retention_tests_candidate_pool_before_selecting_fastest(
+    tmp_path, monkeypatch, capsys
+):
+    source_file = tmp_path / "sources.json"
+    source_file.write_text('{"retention_limit": 40, "sources": []}', encoding="utf-8")
+    output = tmp_path / "subscription.txt"
+    configurations = parse_subscription(
+        "\n".join(
+            f"vless://uuid@node-{index}.example:443#node-{index}"
+            for index in range(45)
+        )
+    )[0]
+    report = CollectionReport(
+        refreshed_at="2026-10-22T00:00:00+00:00",
+        configurations=configurations[:35],
+        sources=[SourceStatus("source-1", "ok", 45)],
+        discovered_count=45,
+        retained_count=35,
+    )
+
+    async def fake_collect(sources, **kwargs):
+        assert kwargs["retention_limit"] == 35
+        return report
+
+    async def fake_test(configs, tester_url, token):
+        return [
+            replace(item, status="tested", healthy=True, latency_ms=float(index))
+            for index, item in enumerate(reversed(configs))
+        ]
+
+    monkeypatch.setattr(cli, "collect", fake_collect)
+    monkeypatch.setattr(cli, "test_configurations", fake_test)
+    monkeypatch.setenv("MKCONFIG_TESTER_URL", "https://tester.example")
+    monkeypatch.setenv(
+        "MKCONFIG_TESTER_TOKEN", "test-token-value-that-is-at-least-32-characters"
+    )
+    args = _arguments(source_file, output)
+    args.limit = 7
+
+    exit_code = asyncio.run(cli._refresh(args))
+    result = json.loads(capsys.readouterr().out)
+    decoded = base64.b64decode(output.read_text(encoding="ascii"), validate=True).decode()
+
+    assert exit_code == 0
+    assert result["tested_count"] == 35
+    assert result["published_count"] == 7
+    assert len(decoded.splitlines()) == 7
+
+
+def test_mixed_candidate_results_publish_only_verified_successes(
+    tmp_path, monkeypatch, capsys
+):
+    source_file = tmp_path / "sources.json"
+    source_file.write_text('{"retention_limit": 40, "sources": []}', encoding="utf-8")
+    output = tmp_path / "subscription.txt"
+    configurations = _sample_configurations()
+    report = CollectionReport(
+        refreshed_at="2026-10-22T00:00:00+00:00",
+        configurations=configurations,
+        sources=[SourceStatus("source-1", "ok", 4)],
+        discovered_count=4,
+        retained_count=4,
+    )
+
+    async def fake_collect(*args, **kwargs):
+        return report
+
+    async def fake_test(configs, tester_url, token):
+        return [
+            replace(
+                item,
+                status="tested",
+                healthy=index < 2,
+                latency_ms=float(index + 1) if index < 2 else None,
+            )
+            for index, item in enumerate(configs)
+        ]
+
+    monkeypatch.setattr(cli, "collect", fake_collect)
+    monkeypatch.setattr(cli, "test_configurations", fake_test)
+    monkeypatch.setenv("MKCONFIG_TESTER_URL", "https://tester.example")
+    monkeypatch.setenv(
+        "MKCONFIG_TESTER_TOKEN", "test-token-value-that-is-at-least-32-characters"
+    )
+    exit_code = asyncio.run(_refresh_for_test(source_file, output))
+    result = json.loads(capsys.readouterr().out)
+    decoded = base64.b64decode(output.read_text(encoding="ascii"), validate=True).decode()
+    published, invalid = parse_subscription(decoded)
+
+    assert exit_code == 0
+    assert result["tested_count"] == 4
+    assert result["failed_test_count"] == 2
+    assert result["published_count"] == 2
+    assert len(published) == 2
+    assert invalid == 0
+
+
+def _refresh_for_test(source_file, output):
+    args = _arguments(source_file, output)
+    return cli._refresh(args)
+
+
+def test_all_candidates_failed_preserves_previous_bytes(tmp_path, monkeypatch, capsys):
+    source_file = tmp_path / "sources.json"
+    source_file.write_text('{"retention_limit": 40, "sources": []}', encoding="utf-8")
+    output = tmp_path / "subscription.txt"
+    previous = b"prior-valid-subscription\nwith-exact-bytes"
+    output.write_bytes(previous)
+    report = CollectionReport(
+        refreshed_at="2026-10-22T00:00:00+00:00",
+        configurations=_sample_configurations(),
+        sources=[SourceStatus("source-1", "ok", 4)],
+        discovered_count=4,
+        retained_count=4,
+    )
+
+    async def fake_collect(*args, **kwargs):
+        return report
+
+    async def fake_test(configs, tester_url, token):
+        return [
+            replace(item, status="tested", healthy=False, latency_ms=None)
+            for item in configs
+        ]
+
+    monkeypatch.setattr(cli, "collect", fake_collect)
+    monkeypatch.setattr(cli, "test_configurations", fake_test)
+    monkeypatch.setenv("MKCONFIG_TESTER_URL", "https://tester.example")
+    monkeypatch.setenv(
+        "MKCONFIG_TESTER_TOKEN", "test-token-value-that-is-at-least-32-characters"
+    )
+    exit_code = asyncio.run(_refresh_for_test(source_file, output))
+    result = json.loads(capsys.readouterr().out)
+
+    assert exit_code == 1
+    assert result["published_count"] == 0
+    assert result["failed_test_count"] == 4
+    assert result["publication_status"] == "preserved_previous"
+    assert output.read_bytes() == previous
+
+
+def test_tester_exception_preserves_previous_bytes(tmp_path, monkeypatch, capsys):
+    source_file = tmp_path / "sources.json"
+    source_file.write_text('{"retention_limit": 40, "sources": []}', encoding="utf-8")
+    output = tmp_path / "subscription.txt"
+    previous = b"prior-valid-subscription\x00with-binary-sentinel"
+    output.write_bytes(previous)
+    report = CollectionReport(
+        refreshed_at="2026-10-22T00:00:00+00:00",
+        configurations=_sample_configurations(),
+        sources=[SourceStatus("source-1", "ok", 4)],
+        discovered_count=4,
+        retained_count=4,
+    )
+
+    async def fake_collect(*args, **kwargs):
+        return report
+
+    async def broken_tester(*args, **kwargs):
+        raise cli.TesterClientError("tester_unavailable")
+
+    monkeypatch.setattr(cli, "collect", fake_collect)
+    monkeypatch.setattr(cli, "test_configurations", broken_tester)
+    monkeypatch.setenv("MKCONFIG_TESTER_URL", "https://tester.example")
+    monkeypatch.setenv(
+        "MKCONFIG_TESTER_TOKEN", "test-token-value-that-is-at-least-32-characters"
+    )
+    exit_code = asyncio.run(_refresh_for_test(source_file, output))
+    result = json.loads(capsys.readouterr().out)
+
+    assert exit_code == 1
+    assert result["test_error"] == "tester_unavailable"
+    assert result["publication_status"] == "preserved_previous"
+    assert output.read_bytes() == previous

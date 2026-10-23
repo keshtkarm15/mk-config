@@ -6,10 +6,14 @@ import asyncio
 import ipaddress
 import socket
 from dataclasses import dataclass
+from datetime import datetime, time
 from typing import Protocol
 from urllib.parse import urlsplit
+from zoneinfo import ZoneInfo
 
-from .core import Configuration
+from .core import Configuration, is_reserved_hostname
+
+TEHRAN_TIMEZONE = ZoneInfo("Asia/Tehran")
 
 
 @dataclass(frozen=True, slots=True)
@@ -35,6 +39,33 @@ class UnavailableTester:
         return TestResult("untested", error="tester_unavailable")
 
 
+def is_tehran_test_window(now: datetime | None = None) -> bool:
+    """Return whether real protocol tests are allowed from 07:00 to 22:00 Tehran time."""
+    current = now if now is not None else datetime.now(TEHRAN_TIMEZONE)
+    if current.tzinfo is None:
+        raise ValueError("test_time_must_be_timezone_aware")
+    local_time = current.astimezone(TEHRAN_TIMEZONE).time().replace(tzinfo=None)
+    return time(7) <= local_time < time(22)
+
+
+class TehranWindowTester:
+    """Gate an available protocol tester to daytime hours in Iran."""
+
+    def __init__(self, tester: ProtocolTester):
+        self._tester = tester
+
+    @property
+    def available(self) -> bool:
+        return self._tester.available
+
+    async def test(
+        self, configuration: Configuration, target_url: str
+    ) -> TestResult:
+        if not self.available or is_tehran_test_window():
+            return await self._tester.test(configuration, target_url)
+        return TestResult("untested", error="outside_test_window")
+
+
 async def validate_test_target(target_url: str, allowed_hosts: set[str]) -> str:
     """Require an allowlisted HTTPS target whose resolved addresses are all public."""
     try:
@@ -42,12 +73,10 @@ async def validate_test_target(target_url: str, allowed_hosts: set[str]) -> str:
         host = (parsed.hostname or "").rstrip(".").lower()
         if parsed.scheme != "https" or not host or parsed.username or parsed.password:
             raise ValueError("unsafe_test_target")
+        if is_reserved_hostname(host):
+            raise ValueError("unsafe_test_target")
         if host not in {entry.rstrip(".").lower() for entry in allowed_hosts}:
             raise ValueError("test_target_not_allowlisted")
-        if host == "localhost" or host.endswith(
-            (".localhost", ".local", ".internal", ".home")
-        ):
-            raise ValueError("unsafe_test_target")
         try:
             address = ipaddress.ip_address(host)
             addresses = [address]

@@ -1,10 +1,18 @@
 import asyncio
 import logging
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 import pytest
 
 from mkconfig.collector import Source, collect, validate_source_url
-from mkconfig.testing import UnavailableTester, validate_test_target
+from mkconfig.testing import (
+    TehranWindowTester,
+    TestResult as ProtocolTestResult,
+    UnavailableTester,
+    is_tehran_test_window,
+    validate_test_target,
+)
 
 
 class FakeContent:
@@ -149,6 +157,9 @@ def test_reject_unsafe_source_urls():
         "https://127.0.0.1/sub",
         "https://user@source.example/sub",
         "https://metadata.google.internal/",
+        "https://example.invalid/",
+        "https://example.test/",
+        "https://example.onion/",
     ):
         with pytest.raises(ValueError):
             validate_source_url(url)
@@ -159,6 +170,45 @@ def test_tester_unavailable_is_explicit_and_never_tests():
     assert result.status == "untested"
     assert result.latency_ms is None
     assert result.error == "tester_unavailable"
+
+
+@pytest.mark.parametrize(
+    ("hour", "minute", "expected"),
+    [(6, 59, False), (7, 0, True), (21, 59, True), (22, 0, False)],
+)
+def test_tehran_test_window_boundaries(hour, minute, expected):
+    local_time = datetime(
+        2026, 10, 23, hour, minute, tzinfo=ZoneInfo("Asia/Tehran")
+    )
+    assert is_tehran_test_window(local_time) is expected
+
+
+def test_tehran_window_tester_skips_real_tester_outside_window(monkeypatch):
+    class FakeTester:
+        available = True
+
+        def __init__(self):
+            self.calls = 0
+
+        async def test(self, configuration, target_url):
+            self.calls += 1
+            return ProtocolTestResult("tested", latency_ms=12)
+
+    async def check():
+        tester = FakeTester()
+        monkeypatch.setattr("mkconfig.testing.is_tehran_test_window", lambda: False)
+        result = await TehranWindowTester(tester).test(None, "https://target.example/")
+        assert result.status == "untested"
+        assert result.error == "outside_test_window"
+        assert tester.calls == 0
+
+        monkeypatch.setattr("mkconfig.testing.is_tehran_test_window", lambda: True)
+        result = await TehranWindowTester(tester).test(None, "https://target.example/")
+        assert result.status == "tested"
+        assert result.latency_ms == 12
+        assert tester.calls == 1
+
+    run(check())
 
 
 def test_allowlist_and_private_test_target_rejection(monkeypatch):
