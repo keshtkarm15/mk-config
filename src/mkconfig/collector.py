@@ -14,7 +14,7 @@ from urllib.parse import urlsplit
 
 import aiohttp
 
-from .core import Configuration, parse_subscription, rank_configurations
+from .core import Configuration, is_reserved_hostname, parse_subscription, rank_configurations
 
 logger = logging.getLogger("mkconfig")
 MAX_TIMEOUT_SECONDS = 300
@@ -75,12 +75,10 @@ class CollectionReport:
 def validate_source_url(url: str) -> None:
     try:
         parsed = urlsplit(url)
-        host = parsed.hostname or ""
+        host = (parsed.hostname or "").rstrip(".").lower()
         if parsed.scheme != "https" or not host or parsed.username or parsed.password:
             raise ValueError("unsafe_source_url")
-        if host == "localhost" or host.endswith(
-            (".localhost", ".local", ".internal", ".home")
-        ):
+        if is_reserved_hostname(host):
             raise ValueError("unsafe_source_url")
         try:
             address = ipaddress.ip_address(host)

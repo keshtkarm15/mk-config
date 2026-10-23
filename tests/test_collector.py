@@ -149,6 +149,9 @@ def test_reject_unsafe_source_urls():
         "https://127.0.0.1/sub",
         "https://user@source.example/sub",
         "https://metadata.google.internal/",
+        "https://example.invalid/",
+        "https://example.test/",
+        "https://example.onion/",
     ):
         with pytest.raises(ValueError):
             validate_source_url(url)

@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from typing import Protocol
 from urllib.parse import urlsplit
 
-from .core import Configuration
+from .core import Configuration, is_reserved_hostname
 
 
 @dataclass(frozen=True, slots=True)
@@ -42,12 +42,10 @@ async def validate_test_target(target_url: str, allowed_hosts: set[str]) -> str:
         host = (parsed.hostname or "").rstrip(".").lower()
         if parsed.scheme != "https" or not host or parsed.username or parsed.password:
             raise ValueError("unsafe_test_target")
+        if is_reserved_hostname(host):
+            raise ValueError("unsafe_test_target")
         if host not in {entry.rstrip(".").lower() for entry in allowed_hosts}:
             raise ValueError("test_target_not_allowlisted")
-        if host == "localhost" or host.endswith(
-            (".localhost", ".local", ".internal", ".home")
-        ):
-            raise ValueError("unsafe_test_target")
         try:
             address = ipaddress.ip_address(host)
             addresses = [address]

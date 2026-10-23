@@ -64,6 +64,17 @@ def test_subscription_output_is_base64_of_valid_deduplicated_uris(tmp_path):
     assert "password" not in str([item.to_dict() for item in configurations])
 
 
+def test_subscription_writer_limit_and_repeat_output(tmp_path):
+    configurations = _sample_configurations()
+    output = tmp_path / "subscription.txt"
+    assert cli._write_subscription(configurations, output, limit=2) == 2
+    first = output.read_text(encoding="ascii")
+    assert len(base64.b64decode(first, validate=True).decode().splitlines()) == 2
+
+    assert cli._write_subscription(configurations, output, limit=2) == 2
+    assert output.read_text(encoding="ascii") == first
+
+
 def test_empty_refresh_preserves_previous_subscription(tmp_path):
     output = tmp_path / "subscription.txt"
     previous = base64.b64encode(b"previous-valid-subscription").decode("ascii")
@@ -94,7 +105,7 @@ def test_refresh_reports_publication_and_source_metrics(tmp_path, monkeypatch, c
         configurations=configurations,
         sources=[
             SourceStatus("source-1", "ok", 4),
-            SourceStatus("source-2", "error", 0, error="timeout"),
+            SourceStatus("source-2", "empty", 0),
         ],
         discovered_count=4,
         retained_count=4,
@@ -141,5 +152,35 @@ def test_empty_refresh_reports_preserved_output_and_failure(
     assert exit_code == 1
     assert result["published_count"] == 0
     assert result["successful_source_count"] == 0
+    assert result["publication_status"] == "preserved_previous"
+    assert output.read_text(encoding="ascii") == previous
+
+
+def test_source_failure_preserves_previous_subscription(tmp_path, monkeypatch, capsys):
+    source_file = tmp_path / "sources.json"
+    source_file.write_text('{"retention_limit": 40, "sources": []}', encoding="utf-8")
+    output = tmp_path / "subscription.txt"
+    previous = base64.b64encode(b"previous-valid-subscription").decode("ascii")
+    output.write_text(previous, encoding="ascii")
+    configurations = _sample_configurations()
+    report = CollectionReport(
+        refreshed_at="2026-10-22T00:00:00+00:00",
+        configurations=configurations,
+        sources=[
+            SourceStatus("source-1", "ok", 4),
+            SourceStatus("source-2", "error", 0, error="timeout"),
+        ],
+        discovered_count=4,
+        retained_count=4,
+    )
+
+    async def fake_collect(*args, **kwargs):
+        return report
+
+    monkeypatch.setattr(cli, "collect", fake_collect)
+    exit_code = asyncio.run(cli._refresh(_arguments(source_file, output)))
+    result = json.loads(capsys.readouterr().out)
+
+    assert exit_code == 1
     assert result["publication_status"] == "preserved_previous"
     assert output.read_text(encoding="ascii") == previous

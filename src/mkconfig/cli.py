@@ -12,7 +12,13 @@ import tempfile
 from pathlib import Path
 
 from .collector import Source, collect
-from .core import DEFAULT_RETENTION_LIMIT, V2RAYNG_PROTOCOLS, encode_subscription
+from .core import (
+    DEFAULT_RETENTION_LIMIT,
+    V2RAYNG_PROTOCOLS,
+    decode_subscription,
+    encode_subscription,
+    parse_subscription,
+)
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -38,10 +44,17 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _write_subscription(configurations, output: Path) -> int:
-    encoded = encode_subscription(configurations)
+def _write_subscription(
+    configurations, output: Path, limit: int = DEFAULT_RETENTION_LIMIT
+) -> int:
+    encoded = encode_subscription(configurations, limit=limit)
     if not encoded:
         return 0
+    decoded = decode_subscription(encoded)
+    validated, invalid_count = parse_subscription(decoded)
+    lines = [line for line in decoded.splitlines() if line.strip()]
+    if invalid_count or len(validated) != len(lines) or len(lines) > limit:
+        raise ValueError("encoded_subscription_validation_failed")
 
     output.parent.mkdir(parents=True, exist_ok=True)
     temporary_path = None
@@ -57,11 +70,7 @@ def _write_subscription(configurations, output: Path) -> int:
     finally:
         if temporary_path is not None:
             temporary_path.unlink(missing_ok=True)
-    return sum(
-        configuration.protocol in V2RAYNG_PROTOCOLS
-        and configuration.subscription_uri is not None
-        for configuration in configurations
-    )
+    return len(lines)
 
 
 async def _refresh(args: argparse.Namespace) -> int:
@@ -102,9 +111,19 @@ async def _refresh(args: argparse.Namespace) -> int:
     result["successful_source_count"] = sum(
         source.status == "ok" for source in report.sources
     )
+    result["invalid_count"] = sum(source.invalid_count for source in report.sources)
+    result["duplicate_count"] = max(
+        0,
+        sum(source.count for source in report.sources) - report.discovered_count,
+    )
     result["connection_test_status"] = "untested"
     if args.output is not None:
-        published_count = _write_subscription(report.configurations, args.output)
+        source_failure = any(source.status == "error" for source in report.sources)
+        published_count = (
+            0
+            if source_failure
+            else _write_subscription(report.configurations, args.output, limit)
+        )
         result["published_count"] = published_count
         result["publication_status"] = (
             "updated" if published_count else "preserved_previous"
