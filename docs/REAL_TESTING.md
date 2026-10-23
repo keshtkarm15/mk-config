@@ -4,6 +4,8 @@ MK.CONFIG does not ship a proxy engine and does not connect to collected endpoin
 
 The `ProtocolTester` interface in `mkconfig.testing` is the integration boundary for a compatible engine such as sing-box. An adapter must report success only after the engine establishes the selected protocol connection and successfully completes an HTTPS request to a configured test target. It must measure elapsed time around that actual request, apply a strict connection and request timeout, cap concurrency, terminate the engine process, and return no latency on failure.
 
+Wrap an available adapter in `TehranWindowTester` to restrict real checks to 07:00 through 21:59:59 Asia/Tehran. Outside that window it returns `untested` without invoking the adapter. This is a time gate, not an engine; the repository currently has no real protocol adapter configured, so no latency measurements are produced.
+
 Before invoking any engine, the integration must:
 
 - use only configurations explicitly selected by the operator;
