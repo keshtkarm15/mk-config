@@ -1,0 +1,30 @@
+FROM python:3.11-slim-bookworm
+
+ARG SING_BOX_VERSION=1.14.3
+ARG SING_BOX_SHA256=cadbaded70a635d0c37bf52614d8e3116542243247211e0b441328595c62acb6
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl util-linux \
+    && rm -rf /var/lib/apt/lists/* \
+    && curl --fail --silent --show-error --location \
+        "https://github.com/SagerNet/sing-box/releases/download/v${SING_BOX_VERSION}/sing-box-${SING_BOX_VERSION}-linux-amd64-glibc.tar.gz" \
+        --output /tmp/sing-box.tar.gz \
+    && echo "${SING_BOX_SHA256}  /tmp/sing-box.tar.gz" | sha256sum --check - \
+    && tar -xzf /tmp/sing-box.tar.gz --strip-components=1 \
+        -C /usr/local/bin "sing-box-${SING_BOX_VERSION}-linux-amd64-glibc/sing-box" \
+    && chmod 0755 /usr/local/bin/sing-box \
+    && rm /tmp/sing-box.tar.gz \
+    && groupadd --gid 10001 app \
+    && useradd --uid 10001 --gid 10001 --no-create-home --shell /usr/sbin/nologin app
+
+WORKDIR /app
+COPY pyproject.toml README.md requirements-tester.txt ./
+COPY src ./src
+RUN python -m pip install --no-cache-dir --disable-pip-version-check . -r requirements-tester.txt
+
+USER 10001:10001
+EXPOSE 10000
+CMD ["python", "-m", "mkconfig.tester_serve"]

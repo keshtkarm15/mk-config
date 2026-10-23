@@ -63,7 +63,11 @@ class CollectionReport:
             "retained_count": self.retained_count,
             "tester": {
                 "available": self.tester_available,
-                "limitation": "No real protocol tester configured; configurations are untested.",
+                "limitation": (
+                    None
+                    if self.tester_available
+                    else "No real protocol tester configured; configurations are untested."
+                ),
             },
             "sources": [source.to_dict() for source in self.sources],
             "configurations": [

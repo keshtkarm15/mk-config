@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: mk-config-protocol-tester
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile.tester
+    healthCheckPath: /health
+    envVars:
+      - key: MKCONFIG_TESTER_TOKEN
+        sync: false
+      - key: MKCONFIG_TEST_URL
+        value: https://www.gstatic.com/generate_204
+      - key: MKCONFIG_TEST_ALLOWED_HOSTS
+        value: www.gstatic.com

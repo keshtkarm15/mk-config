@@ -2,7 +2,8 @@ name: Refresh configurations
 
 on:
   schedule:
-    - cron: "0 */2 * * *"
+    # UTC+03:30: 03:30-17:30 UTC runs at 07:00-21:00 Tehran, every two hours.
+    - cron: "30 3-17/2 * * *"
   workflow_dispatch:
     inputs:
       retention_limit:
@@ -23,6 +24,8 @@ jobs:
     runs-on: ubuntu-latest
     env:
       RETENTION_LIMIT: ${{ inputs.retention_limit || '40' }}
+      MKCONFIG_TESTER_URL: ${{ vars.MKCONFIG_TESTER_URL }}
+      MKCONFIG_TESTER_TOKEN: ${{ secrets.MKCONFIG_TESTER_TOKEN }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
